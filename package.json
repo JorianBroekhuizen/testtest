@@ -1,0 +1,12 @@
+{
+  "name": "world-date-app",
+  "version": "1.0.0",
+  "description": "Simple web app showing date/time around the world per country",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
