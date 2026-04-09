@@ -4,9 +4,15 @@
   "description": "Simple web app showing date/time around the world per country",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "weather": "node weather.js",
+    "chess": "node chess.js"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^2.6.9"
+  }
 }
