@@ -16,7 +16,7 @@
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; overflow: hidden; }
-  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
   canvas.meteor-mode { cursor: crosshair; }
   canvas.dragging { cursor: grabbing; }
 
@@ -39,9 +39,12 @@
   button.danger:hover { background: #6a222d; }
   button.primary { background: #2b3a80; }
   button.primary:hover { background: #38499e; }
+  button.small { padding: 4px 8px; font-size: 12px; }
   label { display: flex; justify-content: space-between; color: var(--muted); margin: 8px 0 3px; }
   label span:last-child { color: var(--text); }
   input[type=range] { width: 100%; accent-color: var(--accent); }
+  .views { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+  .views button { flex: 1; }
 
   .stats {
     position: fixed; top: 12px; right: 12px; background: var(--panel); border: 1px solid var(--border);
@@ -79,11 +82,18 @@
 
 <div class="panel">
   <h1>☄️ Zonnestelsel Vernietiger</h1>
-  <p>Draai het zonnestelsel, schiet meteoren af en vernietig werelden.</p>
+  <p>Draai en kantel het zonnestelsel, schiet meteoren af en vernietig werelden.</p>
 
   <div class="row tools">
-    <button id="toolRotate" class="active" title="Sleep om het zonnestelsel te draaien (toets 1)">🔄 Draaien</button>
+    <button id="toolRotate" class="active" title="Sleep om te draaien en te kantelen (toets 1)">🔄 Draaien</button>
     <button id="toolMeteor" title="Sleep om een meteoor af te schieten (toets 2)">☄️ Meteoor</button>
+  </div>
+
+  <label><span>Kanteling (3D)</span><span id="tiltVal">55°</span></label>
+  <input id="tilt" type="range" min="0" max="80" step="1" value="55" />
+  <div class="views">
+    <button id="view2d" class="small">Bovenaanzicht</button>
+    <button id="view3d" class="small active">3D</button>
   </div>
 
   <label><span>Baansnelheid</span><span id="speedVal">1.0×</span></label>
@@ -106,10 +116,11 @@
   <div class="lbl">werelden vernietigd</div>
   <div class="small">Meteoren: <b id="meteors">0</b></div>
   <div class="small">Nog over: <b id="remaining">8</b></div>
+  <div class="small">Gruis in baan: <b id="gruis">0</b></div>
 </div>
 
 <div class="hint">
-  <kbd>Sleep</kbd> draaien &nbsp;·&nbsp; <kbd>Scroll</kbd> zoomen &nbsp;·&nbsp; <kbd>2</kbd> meteoor-modus: sleep om te richten &nbsp;·&nbsp; <kbd>Spatie</kbd> pauze
+  <kbd>Sleep</kbd> draaien &amp; kantelen &nbsp;·&nbsp; <kbd>Scroll</kbd> zoomen &nbsp;·&nbsp; <kbd>2</kbd> meteoor-modus: sleep om te richten &nbsp;·&nbsp; <kbd>Spatie</kbd> pauze
 </div>
 
 <div class="toast" id="toast"></div>
@@ -123,7 +134,8 @@
   // ---------- State ----------
   const state = {
     tool: 'rotate',          // 'rotate' | 'meteor'
-    viewAngle: 0,            // rotation of the whole solar system (radians)
+    yaw: 0,                  // rotation of the whole solar system around the sun (radians)
+    pitch: 55 * Math.PI / 180, // camera tilt: 0 = top-down, ~80° = almost edge-on
     zoom: 1,
     speed: 1,
     paused: false,
@@ -133,8 +145,16 @@
     time: 0,
   };
 
-  const SUN = { r: 34, mass: 60000 };
+  // Perspective focal length in world pixels. Larger = flatter perspective.
+  const FOCAL = 1600;
+
+  // Gravity. The sun mass is tuned so a meteor at ~200px needs ~140px/s for a circular
+  // orbit: slow shots fall in or get captured, fast shots slingshot around the sun.
+  // Planet mass scales with r² so the planet/sun mass ratio, orbital speeds of debris
+  // around a planet, and the size of a planet's gravitational sphere (Hill radius) all
+  // stay in proportion with each other.
   const G = 1;
+  const SUN = { r: 34, mass: 4000000 };
 
   // Planets: orbit radius (px in world space), body radius, period (seconds per orbit at speed 1×)
   const PLANET_DEFS = [
@@ -151,20 +171,26 @@
   let planets = [];
   let meteors = [];
   let particles = [];
-  let debris = [];   // orbiting fragments left behind by destroyed worlds
+  let debris = [];    // fragments left in the sun's orbit by destroyed worlds
+  let gruis = [];     // impact rubble orbiting a planet under that planet's gravity
   let stars = [];
   let shake = 0;
 
   function makePlanets() {
-    return PLANET_DEFS.map((d, i) => ({
-      ...d,
-      angle: (i * 2.399) % (Math.PI * 2),
-      maxHp: d.hp,
-      hp: d.hp,
-      hitFlash: 0,
-      alive: true,
-      mass: d.r * d.r * 6,
-    }));
+    return PLANET_DEFS.map((d, i) => {
+      const mass = d.r * d.r * 300;
+      return {
+        ...d,
+        angle: (i * 2.399) % (Math.PI * 2),
+        maxHp: d.hp,
+        hp: d.hp,
+        hitFlash: 0,
+        alive: true,
+        mass,
+        // Hill radius: beyond this the sun's pull wins and rubble drifts away.
+        hill: d.orbit * Math.cbrt(mass / (3 * SUN.mass)),
+      };
+    });
   }
 
   function makeStars() {
@@ -176,7 +202,7 @@
 
   function reset() {
     planets = makePlanets();
-    meteors = []; particles = []; debris = [];
+    meteors = []; particles = []; debris = []; gruis = [];
     state.destroyed = 0; state.meteorsLaunched = 0; state.time = 0;
     updateStats();
   }
@@ -185,16 +211,34 @@
   function planetPos(p) {
     return { x: Math.cos(p.angle) * p.orbit, y: Math.sin(p.angle) * p.orbit };
   }
-  // world -> screen
-  function toScreen(x, y) {
-    const c = Math.cos(state.viewAngle), s = Math.sin(state.viewAngle);
-    return { x: W / 2 + (x * c - y * s) * state.zoom, y: H / 2 + (x * s + y * c) * state.zoom };
+  function planetVel(p) {
+    const w = (Math.PI * 2 / p.period) * state.speed;
+    return { x: -Math.sin(p.angle) * p.orbit * w, y: Math.cos(p.angle) * p.orbit * w };
   }
-  // screen -> world
+
+  // 3D projection. World: x/y in the orbital plane, z up. Yaw spins the system,
+  // pitch tilts the camera. Returns screen position plus a scale factor k
+  // (size multiplier for perspective) and depth d (bigger = closer to viewer).
+  function project(x, y, z = 0) {
+    const c = Math.cos(state.yaw), s = Math.sin(state.yaw);
+    const rx = x * c - y * s, ry = x * s + y * c;
+    const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
+    const sy = ry * cp - z * sp;
+    const d = ry * sp + z * cp;
+    const k = FOCAL / (FOCAL - d) * state.zoom;
+    return { x: W / 2 + rx * k, y: H / 2 + sy * k, k, d };
+  }
+  // Inverse projection of a screen point onto the orbital plane (z = 0).
   function toWorld(sx, sy) {
-    const dx = (sx - W / 2) / state.zoom, dy = (sy - H / 2) / state.zoom;
-    const c = Math.cos(-state.viewAngle), s = Math.sin(-state.viewAngle);
-    return { x: dx * c - dy * s, y: dx * s + dy * c };
+    const X = sx - W / 2, Y = sy - H / 2;
+    const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
+    let denom = cp * FOCAL * state.zoom + Y * sp;
+    if (denom < 60) denom = 60; // point is above the horizon; clamp to something sane
+    const ry = Y * FOCAL / denom;
+    const k = FOCAL / (FOCAL - ry * sp) * state.zoom;
+    const rx = X / k;
+    const c = Math.cos(state.yaw), s = Math.sin(state.yaw);
+    return { x: rx * c + ry * s, y: -rx * s + ry * c };
   }
 
   // ---------- Meteors ----------
@@ -219,50 +263,93 @@
     const a = Math.random() * Math.PI * 2;
     const dist = 620;
     const x = Math.cos(a) * dist, y = Math.sin(a) * dist;
-    // aim at a random living planet's *future* position, or the sun
     const alive = planets.filter(p => p.alive);
     let tx = 0, ty = 0;
     if (alive.length && Math.random() < 0.9) {
       const p = alive[Math.floor(Math.random() * alive.length)];
-      const lead = { ...p, angle: p.angle + (Math.PI * 2 / p.period) * state.speed * 4 };
+      const lead = { ...p, angle: p.angle + (Math.PI * 2 / p.period) * state.speed * 3 };
       ({ x: tx, y: ty } = planetPos(lead));
     }
     const dx = tx - x, dy = ty - y, d = Math.hypot(dx, dy);
-    const spd = 150 + Math.random() * 90;
+    const spd = 190 + Math.random() * 110;
     spawnMeteor(x, y, dx / d * spd, dy / d * spd, state.meteorSize);
   }
 
   // ---------- Explosions ----------
-  function burst(x, y, n, color, speed, life, size) {
+  function burst(x, y, n, color, speed, life, size, z = 0) {
     for (let i = 0; i < n; i++) {
+      // random direction on a sphere so explosions have depth in the 3D view
       const a = Math.random() * Math.PI * 2;
+      const u = Math.random() * 2 - 1;
+      const rr = Math.sqrt(1 - u * u);
       const v = Math.random() * speed;
-      particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life, maxLife: life, color, size: Math.random() * size + 1 });
+      particles.push({ x, y, z, vx: Math.cos(a) * rr * v, vy: Math.sin(a) * rr * v, vz: u * v * 0.6, life, maxLife: life, color, size: Math.random() * size + 1 });
     }
   }
 
-  function destroyPlanet(p, impactVx, impactVy) {
+  // Impact rubble: fragments knocked off a planet that stay in orbit around it.
+  // Speeds come straight from the planet's mass (v = sqrt(GM/r)), so heavy planets
+  // hold fast, wide swarms and light ones barely keep anything.
+  function spawnGruis(p, m) {
+    const pp = planetPos(p);
+    const impactAngle = Math.atan2(m.y - pp.y, m.x - pp.x);
+    // spin direction follows the meteor's angular momentum around the planet
+    const relx = m.x - pp.x, rely = m.y - pp.y;
+    const pv = planetVel(p);
+    const cross = relx * (m.vy - pv.y) - rely * (m.vx - pv.x);
+    const spinSign = cross >= 0 ? 1 : -1;
+    const n = 5 + Math.round(m.r * 1.6);
+    for (let i = 0; i < n; i++) {
+      const a = impactAngle + (Math.random() - 0.5) * 1.4;
+      const r0 = p.r * (1.25 + Math.random() * 0.9);
+      const rx = Math.cos(a) * r0, ry = Math.sin(a) * r0, rz = (Math.random() - 0.5) * p.r * 0.4;
+      const vc = Math.sqrt(G * p.mass / r0);
+      const sign = Math.random() < 0.8 ? spinSign : -spinSign;
+      const vt = vc * (0.8 + Math.random() * 0.4) * sign;
+      gruis.push({
+        p,
+        rx, ry, rz,
+        vx: -Math.sin(a) * vt + Math.cos(a) * vc * (Math.random() - 0.5) * 0.4,
+        vy: Math.cos(a) * vt + Math.sin(a) * vc * (Math.random() - 0.5) * 0.4,
+        vz: (Math.random() - 0.5) * vc * 0.35,
+        r: 0.6 + Math.random() * 1.2,
+        color: mix(p.color, '#9a9a9a', 0.55),
+      });
+    }
+    if (gruis.length > 500) gruis.splice(0, gruis.length - 500);
+  }
+
+  function destroyPlanet(p) {
     p.alive = false;
     const pos = planetPos(p);
     burst(pos.x, pos.y, 90, p.color, 220, 1.6, 3);
     burst(pos.x, pos.y, 40, '#ffffff', 320, 0.7, 2);
     burst(pos.x, pos.y, 50, '#ffb347', 160, 1.2, 2.5);
-    // shockwave
-    particles.push({ x: pos.x, y: pos.y, ring: true, r: p.r, life: 1.1, maxLife: 1.1, color: p.color });
-    // leave an asteroid belt of fragments in orbit
+    particles.push({ x: pos.x, y: pos.y, z: 0, ring: true, r: p.r, life: 1.1, maxLife: 1.1, color: p.color });
+    // orbiting rubble loses its anchor and flies off with the planet's velocity
+    const pv = planetVel(p);
+    for (const g of gruis) {
+      if (g.p !== p) continue;
+      particles.push({ x: pos.x + g.rx, y: pos.y + g.ry, z: g.rz, vx: pv.x + g.vx, vy: pv.y + g.vy, vz: g.vz, life: 3, maxLife: 3, color: g.color, size: g.r });
+    }
+    gruis = gruis.filter(g => g.p !== p);
+    // leave an asteroid belt of fragments in the planet's old orbit
     const count = Math.round(p.r * 3);
     for (let i = 0; i < count; i++) {
       debris.push({
         orbit: p.orbit + (Math.random() - 0.5) * p.r * 2.2,
         angle: p.angle + (Math.random() - 0.5) * 0.6,
         period: p.period * (0.9 + Math.random() * 0.2),
+        z: (Math.random() - 0.5) * p.r * 0.6,
         r: Math.random() * 1.6 + 0.6,
         color: p.color,
       });
     }
     state.destroyed++;
     shake = Math.min(24, 8 + p.r * 0.6);
-    showToast(`${p.name.toUpperCase()} VERNIETIGD`, remainingCount() === 0 ? 'Het hele zonnestelsel is weg. Goed gedaan, monster.' : (remainingCount() === 1 ? "1 wereld over" : `${remainingCount()} werelden over`));
+    const left = remainingCount();
+    showToast(`${p.name.toUpperCase()} VERNIETIGD`,
+      left === 0 ? 'Het hele zonnestelsel is weg. Goed gedaan, monster.' : left === 1 ? '1 wereld over' : `${left} werelden over`);
     updateStats();
   }
 
@@ -327,26 +414,50 @@
         const pp = planetPos(p);
         if (Math.hypot(pp.x - m.x, pp.y - m.y) < p.r + m.r) {
           m.dead = true;
-          const spd = Math.hypot(m.vx, m.vy);
-          const dmg = m.mass * spd * 0.012;
+          const pv = planetVel(p);
+          const spd = Math.hypot(m.vx - pv.x, m.vy - pv.y);
+          // damage grows a bit faster than area with size, and linearly with impact speed
+          const dmg = Math.pow(m.r, 2.2) * (spd / 250);
           p.hp -= dmg;
           p.hitFlash = 1;
           burst(m.x, m.y, 30 + Math.round(m.r * 3), '#ffb347', 140 + m.r * 10, 0.8, 2.2);
           burst(m.x, m.y, 12, p.color, 90, 1, 2);
           shake = Math.max(shake, 3 + m.r * 0.5);
-          if (p.hp <= 0) destroyPlanet(p, m.vx, m.vy);
+          if (p.hp <= 0) destroyPlanet(p);
+          else spawnGruis(p, m);
           break;
         }
       }
-      if (Math.hypot(m.x, m.y) > 1600 || m.life > 60) m.dead = true;
+      if (Math.hypot(m.x, m.y) > 1600 || m.life > 120) m.dead = true;
     }
     meteors = meteors.filter(m => !m.dead);
+
+    // Impact rubble: two-body motion around its planet.
+    const GSUB = 2, gh = dt / GSUB;
+    for (const g of gruis) {
+      const p = g.p;
+      for (let s = 0; s < GSUB; s++) {
+        const r2 = g.rx * g.rx + g.ry * g.ry + g.rz * g.rz + 4;
+        const r = Math.sqrt(r2);
+        const a = -G * p.mass / r2;
+        g.vx += a * g.rx / r * gh; g.vy += a * g.ry / r * gh; g.vz += a * g.rz / r * gh;
+        g.rx += g.vx * gh; g.ry += g.vy * gh; g.rz += g.vz * gh;
+      }
+      const r = Math.hypot(g.rx, g.ry, g.rz);
+      if (r < p.r * 0.95) { g.dead = true; continue; }        // fell back onto the planet
+      if (r > p.hill) {                                          // escaped the planet's grip
+        g.dead = true;
+        const pp = planetPos(p), pv = planetVel(p);
+        particles.push({ x: pp.x + g.rx, y: pp.y + g.ry, z: g.rz, vx: pv.x + g.vx, vy: pv.y + g.vy, vz: g.vz, life: 2.5, maxLife: 2.5, color: g.color, size: g.r, drift: true });
+      }
+    }
+    if (gruis.some(g => g.dead)) { gruis = gruis.filter(g => !g.dead); updateStats(); }
 
     for (const q of particles) {
       q.life -= dt;
       if (q.ring) { q.r += dt * 260; continue; }
-      q.x += q.vx * dt; q.y += q.vy * dt;
-      q.vx *= 0.985; q.vy *= 0.985;
+      q.x += q.vx * dt; q.y += q.vy * dt; q.z += (q.vz || 0) * dt;
+      if (!q.drift) { q.vx *= 0.985; q.vy *= 0.985; if (q.vz) q.vz *= 0.985; }
     }
     particles = particles.filter(q => q.life > 0);
     shake *= Math.pow(0.02, dt);
@@ -368,169 +479,91 @@
     }
     ctx.globalAlpha = 1;
 
-    // camera shake
     if (shake > 0) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
 
-    ctx.save();
-    ctx.translate(W / 2, H / 2);
-    ctx.rotate(state.viewAngle);
-    ctx.scale(state.zoom, state.zoom);
-
-    // orbits
-    ctx.lineWidth = 1 / state.zoom;
+    // orbit rings (projected circles)
+    ctx.lineWidth = 1;
     for (const p of planets) {
       ctx.beginPath();
-      ctx.arc(0, 0, p.orbit, 0, Math.PI * 2);
+      for (let i = 0; i <= 96; i++) {
+        const a = i / 96 * Math.PI * 2;
+        const s = project(Math.cos(a) * p.orbit, Math.sin(a) * p.orbit);
+        if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y);
+      }
       ctx.strokeStyle = p.alive ? 'rgba(160,175,230,0.18)' : 'rgba(160,175,230,0.06)';
-      ctx.setLineDash(p.alive ? [] : [4 / state.zoom, 6 / state.zoom]);
+      ctx.setLineDash(p.alive ? [] : [4, 6]);
       ctx.stroke();
     }
     ctx.setLineDash([]);
 
-    // sun
+    // sun glow sits behind everything else
+    const sun = project(0, 0);
     const pulse = 1 + Math.sin(state.time * 2) * 0.03;
-    let g = ctx.createRadialGradient(0, 0, SUN.r * 0.6, 0, 0, SUN.r * 3.2 * pulse);
+    const glowR = SUN.r * 3.2 * pulse * sun.k;
+    let g = ctx.createRadialGradient(sun.x, sun.y, SUN.r * 0.6 * sun.k, sun.x, sun.y, glowR);
     g.addColorStop(0, 'rgba(255,190,80,0.55)');
     g.addColorStop(0.4, 'rgba(255,120,40,0.18)');
     g.addColorStop(1, 'rgba(255,90,20,0)');
     ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(0, 0, SUN.r * 3.2 * pulse, 0, Math.PI * 2); ctx.fill();
-    g = ctx.createRadialGradient(-SUN.r * 0.3, -SUN.r * 0.3, 2, 0, 0, SUN.r);
-    g.addColorStop(0, '#fff6d5');
-    g.addColorStop(0.5, '#ffcf5a');
-    g.addColorStop(1, '#ff8a2b');
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(0, 0, SUN.r, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sun.x, sun.y, glowR, 0, Math.PI * 2); ctx.fill();
 
-    // debris belts
-    for (const d of debris) {
-      const x = Math.cos(d.angle) * d.orbit, y = Math.sin(d.angle) * d.orbit;
-      ctx.fillStyle = d.color;
-      ctx.globalAlpha = 0.7;
-      ctx.beginPath(); ctx.arc(x, y, d.r, 0, Math.PI * 2); ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-
-    // planets
+    // Depth-sorted scene: far objects first.
+    const items = [];
+    items.push({ d: sun.d, draw: () => drawSun(sun) });
     for (const p of planets) {
       if (!p.alive) continue;
-      const { x, y } = planetPos(p);
-      if (p.ring) {
-        ctx.save();
-        ctx.translate(x, y);
-        ctx.rotate(0.4);
-        ctx.strokeStyle = 'rgba(230,207,154,0.65)';
-        ctx.lineWidth = 4;
-        ctx.beginPath(); ctx.ellipse(0, 0, p.r * 1.9, p.r * 0.55, 0, 0, Math.PI * 2); ctx.stroke();
-        ctx.restore();
-      }
-      // shading: light comes from the sun
-      const ang = Math.atan2(y, x);
-      const lg = ctx.createRadialGradient(x - Math.cos(ang) * p.r * 0.5, y - Math.sin(ang) * p.r * 0.5, p.r * 0.1, x, y, p.r);
-      lg.addColorStop(0, lighten(p.color, 0.45));
-      lg.addColorStop(0.7, p.color);
-      lg.addColorStop(1, darken(p.color, 0.6));
-      ctx.fillStyle = lg;
-      ctx.beginPath(); ctx.arc(x, y, p.r, 0, Math.PI * 2); ctx.fill();
-      if (p.earth) {
-        ctx.fillStyle = 'rgba(80,170,90,0.85)';
-        ctx.beginPath(); ctx.arc(x - p.r * 0.3, y - p.r * 0.2, p.r * 0.38, 0, Math.PI * 2); ctx.fill();
-        ctx.beginPath(); ctx.arc(x + p.r * 0.35, y + p.r * 0.3, p.r * 0.25, 0, Math.PI * 2); ctx.fill();
-      }
-      if (p.hitFlash > 0) {
-        ctx.fillStyle = `rgba(255,255,255,${p.hitFlash * 0.8})`;
-        ctx.beginPath(); ctx.arc(x, y, p.r, 0, Math.PI * 2); ctx.fill();
-      }
-      // cracks as health drops
-      const dmgFrac = 1 - p.hp / p.maxHp;
-      if (dmgFrac > 0.05) {
-        ctx.strokeStyle = `rgba(255,120,60,${Math.min(1, dmgFrac * 1.4)})`;
-        ctx.lineWidth = 1.2;
-        const n = Math.floor(dmgFrac * 6) + 1;
-        for (let i = 0; i < n; i++) {
-          const a = i * 1.7 + p.name.length;
-          ctx.beginPath();
-          ctx.moveTo(x + Math.cos(a) * p.r * 0.2, y + Math.sin(a) * p.r * 0.2);
-          ctx.lineTo(x + Math.cos(a + 0.4) * p.r * 0.95, y + Math.sin(a + 0.4) * p.r * 0.95);
-          ctx.stroke();
-        }
-      }
+      const w = planetPos(p);
+      const s = project(w.x, w.y);
+      items.push({ d: s.d, draw: () => drawPlanet(p, s, sun) });
     }
-
-    // meteors
+    for (const d of debris) {
+      const s = project(Math.cos(d.angle) * d.orbit, Math.sin(d.angle) * d.orbit, d.z);
+      items.push({ d: s.d, draw: () => dot(s.x, s.y, d.r * s.k, d.color, 0.7) });
+    }
+    for (const gr of gruis) {
+      const pp = planetPos(gr.p);
+      const s = project(pp.x + gr.rx, pp.y + gr.ry, gr.rz);
+      items.push({ d: s.d, draw: () => dot(s.x, s.y, gr.r * s.k, gr.color, 0.9) });
+    }
     for (const m of meteors) {
-      // trail
-      for (let i = 1; i < m.trail.length; i++) {
-        const t = i / m.trail.length;
-        ctx.strokeStyle = `rgba(255,${Math.round(150 + 80 * t)},80,${t * 0.7})`;
-        ctx.lineWidth = m.r * t * 1.4;
-        ctx.beginPath();
-        ctx.moveTo(m.trail[i - 1].x, m.trail[i - 1].y);
-        ctx.lineTo(m.trail[i].x, m.trail[i].y);
-        ctx.stroke();
-      }
-      ctx.save();
-      ctx.translate(m.x, m.y);
-      ctx.rotate(m.rot);
-      ctx.fillStyle = '#8a7a6a';
-      ctx.beginPath();
-      for (let i = 0; i < 7; i++) {
-        const a = i / 7 * Math.PI * 2;
-        const rr = m.r * (0.8 + 0.3 * Math.sin(i * 2.3));
-        ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
-      }
-      ctx.closePath(); ctx.fill();
-      ctx.fillStyle = 'rgba(0,0,0,0.3)';
-      ctx.beginPath(); ctx.arc(m.r * 0.3, m.r * 0.2, m.r * 0.3, 0, Math.PI * 2); ctx.fill();
-      ctx.restore();
+      const s = project(m.x, m.y);
+      items.push({ d: s.d, draw: () => drawMeteor(m, s) });
     }
-
-    // particles
     for (const q of particles) {
-      const a = Math.max(0, q.life / q.maxLife);
-      if (q.ring) {
-        ctx.strokeStyle = q.color;
-        ctx.globalAlpha = a * 0.8;
-        ctx.lineWidth = 3 * a + 0.5;
-        ctx.beginPath(); ctx.arc(q.x, q.y, q.r, 0, Math.PI * 2); ctx.stroke();
-        continue;
-      }
-      ctx.globalAlpha = a;
-      ctx.fillStyle = q.color;
-      ctx.beginPath(); ctx.arc(q.x, q.y, q.size * a + 0.3, 0, Math.PI * 2); ctx.fill();
+      const s = project(q.x, q.y, q.z || 0);
+      items.push({ d: s.d, draw: () => drawParticle(q, s) });
     }
+    items.sort((a, b) => a.d - b.d);
+    for (const it of items) it.draw();
     ctx.globalAlpha = 1;
 
     // aiming line (meteor tool)
     if (drag.active && drag.tool === 'meteor') {
       const a = drag.startWorld, b = drag.curWorld;
       const r = meteorRadiusFor(state.meteorSize);
-      ctx.setLineDash([6 / state.zoom, 6 / state.zoom]);
+      const sa = project(a.x, a.y), sb = project(b.x, b.y);
+      ctx.setLineDash([6, 6]);
       ctx.strokeStyle = 'rgba(255,179,71,0.9)';
-      ctx.lineWidth = 1.5 / state.zoom;
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(sa.x, sa.y); ctx.lineTo(sb.x, sb.y); ctx.stroke();
       ctx.setLineDash([]);
-      ctx.fillStyle = 'rgba(255,179,71,0.5)';
-      ctx.beginPath(); ctx.arc(a.x, a.y, r, 0, Math.PI * 2); ctx.fill();
-      // preview trajectory
+      dot(sa.x, sa.y, r * sa.k, 'rgba(255,179,71,0.5)', 1);
       drawTrajectoryPreview(a, launchVelocity(a, b), r);
     }
 
-    ctx.restore();
-
-    // planet labels (screen space so text is upright)
+    // labels + health bars (screen space so text stays upright)
     ctx.font = '11px system-ui, sans-serif';
     ctx.textAlign = 'center';
     for (const p of planets) {
       if (!p.alive) continue;
       const w = planetPos(p);
-      const s = toScreen(w.x, w.y);
+      const s = project(w.x, w.y);
+      const R = p.r * s.k;
       ctx.fillStyle = 'rgba(230,233,245,0.75)';
-      ctx.fillText(p.name, s.x, s.y + (p.r + 12) * state.zoom);
-      // health bar
+      ctx.fillText(p.name, s.x, s.y + R + 12);
       if (p.hp < p.maxHp) {
-        const bw = Math.max(22, p.r * 3 * state.zoom), bh = 3;
-        const bx = s.x - bw / 2, by = s.y - (p.r + 8) * state.zoom;
+        const bw = Math.max(22, R * 3), bh = 3;
+        const bx = s.x - bw / 2, by = s.y - R - 8;
         ctx.fillStyle = 'rgba(255,255,255,0.15)';
         ctx.fillRect(bx, by, bw, bh);
         const frac = Math.max(0, p.hp / p.maxHp);
@@ -540,17 +573,141 @@
     }
   }
 
+  function dot(x, y, r, color, alpha) {
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(x, y, Math.max(0.4, r), 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawSun(s) {
+    const R = SUN.r * s.k;
+    const g = ctx.createRadialGradient(s.x - R * 0.3, s.y - R * 0.3, 2, s.x, s.y, R);
+    g.addColorStop(0, '#fff6d5');
+    g.addColorStop(0.5, '#ffcf5a');
+    g.addColorStop(1, '#ff8a2b');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(s.x, s.y, R, 0, Math.PI * 2); ctx.fill();
+  }
+
+  function drawPlanet(p, s, sun) {
+    const R = p.r * s.k;
+    const w = planetPos(p);
+    // Saturn's ring: a projected circle in the orbital plane, split into the half behind
+    // and the half in front of the planet.
+    let ringPts = null;
+    if (p.ring) {
+      ringPts = [];
+      for (let i = 0; i <= 48; i++) {
+        const a = i / 48 * Math.PI * 2;
+        ringPts.push(project(w.x + Math.cos(a) * p.r * 1.9, w.y + Math.sin(a) * p.r * 1.9));
+      }
+      strokeRingPart(ringPts, s.d, false, R);
+    }
+    // shading: light comes from the sun
+    const lx = sun.x - s.x, ly = sun.y - s.y, ll = Math.hypot(lx, ly) || 1;
+    const lg = ctx.createRadialGradient(s.x + lx / ll * R * 0.5, s.y + ly / ll * R * 0.5, R * 0.1, s.x, s.y, R);
+    lg.addColorStop(0, lighten(p.color, 0.45));
+    lg.addColorStop(0.7, p.color);
+    lg.addColorStop(1, darken(p.color, 0.6));
+    ctx.fillStyle = lg;
+    ctx.beginPath(); ctx.arc(s.x, s.y, R, 0, Math.PI * 2); ctx.fill();
+    if (p.earth) {
+      ctx.fillStyle = 'rgba(80,170,90,0.85)';
+      ctx.beginPath(); ctx.arc(s.x - R * 0.3, s.y - R * 0.2, R * 0.38, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(s.x + R * 0.35, s.y + R * 0.3, R * 0.25, 0, Math.PI * 2); ctx.fill();
+    }
+    if (p.hitFlash > 0) {
+      ctx.fillStyle = `rgba(255,255,255,${p.hitFlash * 0.8})`;
+      ctx.beginPath(); ctx.arc(s.x, s.y, R, 0, Math.PI * 2); ctx.fill();
+    }
+    const dmgFrac = 1 - p.hp / p.maxHp;
+    if (dmgFrac > 0.05) {
+      ctx.strokeStyle = `rgba(255,120,60,${Math.min(1, dmgFrac * 1.4)})`;
+      ctx.lineWidth = 1.2;
+      const n = Math.floor(dmgFrac * 6) + 1;
+      for (let i = 0; i < n; i++) {
+        const a = i * 1.7 + p.name.length;
+        ctx.beginPath();
+        ctx.moveTo(s.x + Math.cos(a) * R * 0.2, s.y + Math.sin(a) * R * 0.2);
+        ctx.lineTo(s.x + Math.cos(a + 0.4) * R * 0.95, s.y + Math.sin(a + 0.4) * R * 0.95);
+        ctx.stroke();
+      }
+    }
+    if (ringPts) strokeRingPart(ringPts, s.d, true, R);
+  }
+
+  function strokeRingPart(pts, planetDepth, front, R) {
+    ctx.strokeStyle = 'rgba(230,207,154,0.65)';
+    ctx.lineWidth = Math.max(1, R * 0.18);
+    ctx.beginPath();
+    let pen = false;
+    for (const q of pts) {
+      const isFront = q.d >= planetDepth;
+      if (isFront === front) { if (pen) ctx.lineTo(q.x, q.y); else { ctx.moveTo(q.x, q.y); pen = true; } }
+      else pen = false;
+    }
+    ctx.stroke();
+  }
+
+  function drawMeteor(m, s) {
+    const R = m.r * s.k;
+    // trail
+    for (let i = 1; i < m.trail.length; i++) {
+      const t = i / m.trail.length;
+      const a = project(m.trail[i - 1].x, m.trail[i - 1].y);
+      const b = project(m.trail[i].x, m.trail[i].y);
+      ctx.strokeStyle = `rgba(255,${Math.round(150 + 80 * t)},80,${t * 0.7})`;
+      ctx.lineWidth = Math.max(0.5, R * t * 1.4);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.rotate(m.rot);
+    ctx.fillStyle = '#8a7a6a';
+    ctx.beginPath();
+    for (let i = 0; i < 7; i++) {
+      const a = i / 7 * Math.PI * 2;
+      const rr = R * (0.8 + 0.3 * Math.sin(i * 2.3));
+      ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath(); ctx.arc(R * 0.3, R * 0.2, R * 0.3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawParticle(q, s) {
+    const a = Math.max(0, q.life / q.maxLife);
+    if (q.ring) {
+      ctx.strokeStyle = q.color;
+      ctx.globalAlpha = a * 0.8;
+      ctx.lineWidth = 3 * a + 0.5;
+      ctx.beginPath();
+      for (let i = 0; i <= 48; i++) {
+        const t = i / 48 * Math.PI * 2;
+        const pt = project(q.x + Math.cos(t) * q.r, q.y + Math.sin(t) * q.r);
+        if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      return;
+    }
+    dot(s.x, s.y, (q.size * a + 0.3) * s.k, q.color, a);
+  }
+
   function drawTrajectoryPreview(start, v, r) {
     let x = start.x, y = start.y, vx = v.x, vy = v.y;
     const h = 1 / 60;
     ctx.fillStyle = 'rgba(255,255,255,0.45)';
-    for (let i = 0; i < 240; i++) {
+    for (let i = 0; i < 720; i++) {
       const dsx = -x, dsy = -y, ds2 = dsx * dsx + dsy * dsy + 400, ds = Math.sqrt(ds2);
       const fs = G * SUN.mass / ds2;
       vx += dsx / ds * fs * h; vy += dsy / ds * fs * h;
       x += vx * h; y += vy * h;
-      if (Math.hypot(x, y) < SUN.r + r) break;
-      if (i % 6 === 0) { ctx.beginPath(); ctx.arc(x, y, 1.2 / state.zoom, 0, Math.PI * 2); ctx.fill(); }
+      const dist = Math.hypot(x, y);
+      if (dist < SUN.r + r || dist > 1600) break;
+      if (i % 6 === 0) { const s = project(x, y); ctx.beginPath(); ctx.arc(s.x, s.y, 1.2, 0, Math.PI * 2); ctx.fill(); }
     }
   }
 
@@ -558,7 +715,7 @@
     // slingshot: drag away from target, launch toward opposite direction
     const dx = a.x - b.x, dy = a.y - b.y;
     const d = Math.hypot(dx, dy);
-    const spd = Math.min(420, d * 1.6);
+    const spd = Math.min(520, d * 1.6);
     if (d < 1) return { x: 0, y: 0 };
     return { x: dx / d * spd, y: dy / d * spd };
   }
@@ -574,7 +731,7 @@
   }
 
   // ---------- Input ----------
-  const drag = { active: false, tool: null, startX: 0, startY: 0, startAngle: 0, startWorld: null, curWorld: null };
+  const drag = { active: false, tool: null, lastX: 0, lastY: 0, startWorld: null, curWorld: null };
 
   function pointerPos(e) {
     const rect = canvas.getBoundingClientRect();
@@ -586,8 +743,7 @@
     const p = pointerPos(e);
     drag.active = true;
     drag.tool = (e.shiftKey || e.button === 2) ? 'meteor' : state.tool;
-    drag.startX = p.x; drag.startY = p.y;
-    drag.startAngle = state.viewAngle;
+    drag.lastX = p.x; drag.lastY = p.y;
     drag.startWorld = toWorld(p.x, p.y);
     drag.curWorld = drag.startWorld;
     canvas.classList.add('dragging');
@@ -596,14 +752,14 @@
     if (!drag.active) return;
     const p = pointerPos(e);
     if (drag.tool === 'rotate') {
-      const a0 = Math.atan2(drag.startY - H / 2, drag.startX - W / 2);
-      const a1 = Math.atan2(p.y - H / 2, p.x - W / 2);
-      state.viewAngle = drag.startAngle + (a1 - a0);
+      state.yaw += (p.x - drag.lastX) * 0.006;
+      setPitch(state.pitch + (p.y - drag.lastY) * 0.005);
     } else {
       drag.curWorld = toWorld(p.x, p.y);
     }
+    drag.lastX = p.x; drag.lastY = p.y;
   });
-  function endDrag(e) {
+  function endDrag() {
     if (!drag.active) return;
     drag.active = false;
     canvas.classList.remove('dragging');
@@ -632,6 +788,19 @@
   document.getElementById('randomMeteor').onclick = spawnRandomMeteor;
   document.getElementById('reset').onclick = reset;
   document.getElementById('pause').onclick = togglePause;
+  document.getElementById('view2d').onclick = () => setPitch(0);
+  document.getElementById('view3d').onclick = () => setPitch(55 * Math.PI / 180);
+
+  const tiltEl = document.getElementById('tilt');
+  function setPitch(rad) {
+    state.pitch = Math.min(80 * Math.PI / 180, Math.max(0, rad));
+    const deg = Math.round(state.pitch * 180 / Math.PI);
+    tiltEl.value = deg;
+    document.getElementById('tiltVal').textContent = deg + '°';
+    document.getElementById('view2d').classList.toggle('active', deg === 0);
+    document.getElementById('view3d').classList.toggle('active', deg > 0);
+  }
+  tiltEl.oninput = () => setPitch(+tiltEl.value * Math.PI / 180);
 
   function togglePause() {
     state.paused = !state.paused;
@@ -650,14 +819,17 @@
     if (e.key === ' ') { e.preventDefault(); togglePause(); }
     if (e.key.toLowerCase() === 'm') spawnRandomMeteor();
     if (e.key.toLowerCase() === 'r') reset();
-    if (e.key === 'ArrowLeft') state.viewAngle -= 0.1;
-    if (e.key === 'ArrowRight') state.viewAngle += 0.1;
+    if (e.key === 'ArrowLeft') state.yaw -= 0.1;
+    if (e.key === 'ArrowRight') state.yaw += 0.1;
+    if (e.key === 'ArrowUp') { e.preventDefault(); setPitch(state.pitch - 0.05); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); setPitch(state.pitch + 0.05); }
   });
 
   function updateStats() {
     document.getElementById('destroyed').textContent = state.destroyed;
     document.getElementById('meteors').textContent = state.meteorsLaunched;
     document.getElementById('remaining').textContent = remainingCount();
+    document.getElementById('gruis').textContent = gruis.length;
   }
 
   // ---------- Loop ----------
@@ -666,7 +838,6 @@
     W = window.innerWidth; H = window.innerHeight;
     canvas.width = W * DPR; canvas.height = H * DPR;
     canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
-    // fit the whole system on screen at start
     const fit = Math.min(W, H) / 2 / 540;
     if (!resize.done) { state.zoom = Math.min(1, Math.max(0.35, fit)); resize.done = true; }
   }
@@ -684,6 +855,7 @@
   resize();
   makeStars();
   reset();
+  setPitch(state.pitch);
   requestAnimationFrame(frame);
 })();
 </script>
